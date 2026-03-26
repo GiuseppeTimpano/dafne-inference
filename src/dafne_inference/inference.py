@@ -8,6 +8,7 @@ from monai.transforms import (
     CastToTyped,
     DivisiblePadd
 )
+from monai.data import MetaTensor
 from dafne_inference.transforms import PreprocessAnisotropy
 
 
@@ -17,7 +18,17 @@ def run_inference(model_obj, data_dict: dict) -> dict:
     if not input_image.shape[0] < input_image.shape[1]:
         input_image = np.ascontiguousarray(np.moveaxis(input_image, -1, 0))
 
-    data = {'image': input_image}
+    try:
+        affine_numpy = data_dict['affine']
+    except KeyError:
+        resolution = data_dict['resolution'] # this is always present
+        if len(resolution) < 3:
+            pixdim = (resolution[0], resolution[1], 1.0)
+        else:
+            pixdim = (resolution[0], resolution[1], resolution[2])
+        affine_numpy = np.diag([*pixdim, 1.0]).astype(np.float64)
+    
+    data = { 'image': MetaTensor(input_image, affine = affine_numpy) }
 
     net_metadata = model_obj.metadata['net_metadata']
     dyn_model = net_metadata['use_dynamic']
