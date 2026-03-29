@@ -9,6 +9,7 @@ from monai.transforms import (
     DivisiblePadd
 )
 from monai.data import MetaTensor
+from monai.inferers import sliding_window_inference
 from dafne_inference.transforms import PreprocessAnisotropy
 from .utils import _center_crop, _resample_prediction
 
@@ -16,12 +17,16 @@ from .utils import _center_crop, _resample_prediction
 def run_inference(model_obj, data_dict: dict) -> dict:
     input_image = data_dict['image']
 
-    if not input_image.shape[0] < input_image.shape[1]:
+    # dafne sends (X, Y, Z) — convert to (Z, X, Y); Z (slices) is always the smallest axis
+    if input_image.shape[2] < input_image.shape[0]:
         input_image = np.ascontiguousarray(np.moveaxis(input_image, -1, 0))
 
     try:
         affine_numpy = data_dict['affine']
-        pixdim = np.sqrt((affine_numpy[:3, :3] ** 2).sum(axis=0))
+        # affine column norms → spacing in (X, Y, Z) order (dafne convention)
+        # reorder to (Z, X, Y) to match image axes after moveaxis(-1, 0)
+        col_norms = np.sqrt((affine_numpy[:3, :3] ** 2).sum(axis=0))
+        pixdim = np.array([col_norms[2], col_norms[0], col_norms[1]])
     except KeyError:
         resolution = data_dict['resolution']
         if len(resolution) < 3:
@@ -68,7 +73,14 @@ def run_inference(model_obj, data_dict: dict) -> dict:
     with torch.no_grad():
         if spatial_dims == 3:
             img_tensor = img_tensor.unsqueeze(0).to(model_obj.device)
-            output = model_obj.model(img_tensor)
+            # use sliding window for inference during inference
+            output = sliding_window_inference(
+                inputs=img_tensor,
+                roi_size=net_metadata['patch_size'],
+                sw_batch_size=4,
+                overlap=0.25,
+                predictor=model_obj.model
+            )
             pred_torch = torch.argmax(output, dim=1)
             pred_vol = pred_torch[0].detach().cpu().numpy().astype(np.int8)
 
