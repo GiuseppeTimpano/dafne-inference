@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: dafne-monai-inference
-Version: 0.1.1
+Version: 0.1.2
 Summary: Lightweight inference package for dafne models
 Author: GiuseppeTimpano
 Author-email: giuseppe.timpano@unicz.it

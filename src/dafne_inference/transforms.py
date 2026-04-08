@@ -34,24 +34,28 @@ class MapTransformLoadData(MapTransform):
         '''
         d = dict(data)
         image = d['image']
-        image = np.ascontiguousarray(np.moveaxis(image, -1, 0))
+        if image.ndim == 3:
+            image = np.ascontiguousarray(np.moveaxis(image, -1, 0))
         masks = d['mask']
         mask = np.zeros_like(image, dtype=np.uint8)
         resolution = d['resolution']
         index = data.get('index', None)
 
-        try: 
+        try:
             mask_keys = sorted(k for k in masks.keys())
             for i, k in enumerate(mask_keys):
                 m = masks[k].astype(np.uint8)
-                m = np.ascontiguousarray(np.moveaxis(m, -1, 0))
+                if m.ndim == 3:
+                    m = np.ascontiguousarray(np.moveaxis(m, -1, 0))
                 mask[m > 0] = i + 1
-            
-            if self.spatial_dims == 2: 
+
+            if self.spatial_dims == 2 and image.ndim == 3:
                 image = image[index]
                 mask = mask[index]
                 current_res = np.array([resolution[0], resolution[1]], dtype=np.float32)
-            elif self.spatial_dims == 3: 
+            elif self.spatial_dims == 2:
+                current_res = np.array([resolution[0], resolution[1]], dtype=np.float32)
+            elif self.spatial_dims == 3:
                 current_res = np.array([resolution[2], resolution[0], resolution[1]], dtype=np.float32)
             
             d['mask'] = mask
@@ -88,7 +92,7 @@ class PreprocessAnisotropy(MapTransform):
 
         self.training = (model_mode == 'train')
 
-        self.crop_foreg = CropForegroundd(keys=['image'], source_key='image', allow_smaller=True)
+        self.crop_foreg = CropForegroundd(keys=['image', 'mask'], source_key='image', allow_smaller=True, allow_missing_keys=True)
         self.normalize_intensity = NormalizeIntensity(nonzero=True, channel_wise=True)
 
     def calculate_new_shape(self, spacing, shape):
@@ -107,25 +111,32 @@ class PreprocessAnisotropy(MapTransform):
         d = dict(data)
         image = d['image']
 
+        has_mask = 'mask' in self.keys and 'mask' in d
+        label = d['mask'] if has_mask else None
+
         current_spacing = d['image_meta_dict']['pixdim']
         current_spacing = current_spacing[1:] # no channel spacing
         image_spacing = np.array(current_spacing).tolist()
 
         if self.training:
-            cropped_data = self.crop_foreg({"image": image})
+            cropped_data = self.crop_foreg({"image": image, "mask": label} if has_mask else {"image": image})
             if 0 in cropped_data["image"].shape[1:]:
                 pass
             else:
                 image = cropped_data["image"]
+                if has_mask:
+                    label = cropped_data["mask"]
         else:
             d["original_shape"] = np.array(image.shape[1:])
-            box_start, box_end = generate_spatial_bounding_box(image, allow_smaller=True) #return pixels coordinates where the foreground is located
-            temp_image = SpatialCrop(roi_start=box_start, roi_end=box_end)(image) #return cropped image, 0 if the box_start=box_end
+            box_start, box_end = generate_spatial_bounding_box(image, allow_smaller=True)
+            temp_image = SpatialCrop(roi_start=box_start, roi_end=box_end)(image)
             if 0 in temp_image.shape[1:]:
                 d["bbox"] = np.vstack([box_start, box_end])
                 d["crop_shape"] = np.array(image.shape[1:])
-            else: 
+            else:
                 image = temp_image
+                if has_mask:
+                    label = SpatialCrop(roi_start=box_start, roi_end=box_end)(label)
                 d["bbox"] = np.vstack([box_start, box_end])
                 d["crop_shape"] = np.array(image.shape[1:])
 
@@ -135,29 +146,34 @@ class PreprocessAnisotropy(MapTransform):
         anisotrophy_flag = False
 
         if isinstance(image, torch.Tensor): image = image.numpy()
+        if has_mask and isinstance(label, torch.Tensor): label = label.numpy()
 
         if 0 not in original_shape and not np.allclose(self.target_spacing, image_spacing, atol=1e-4):
             resample_flag = True
             anisotrophy_flag = self.check_anisotrophy(image_spacing)
-            
             resample_shape = self.calculate_new_shape(image_spacing, original_shape)
-            
+
             if self.spatial_dims == 3:
                 image = resample_image(image, resample_shape, anisotrophy_flag)
-            elif self.spatial_dims == 2: 
+                if has_mask:
+                    from .utils import _resample_prediction
+                    label = np.expand_dims(
+                        _resample_prediction(label[0], tuple(resample_shape), anisotrophy_flag), 0
+                    ).astype(np.uint8)
+            elif self.spatial_dims == 2:
                 resized_channels = []
                 for img_c in image:
-                    res = resize(
-                        img_c,
-                        resample_shape,
-                        order=3,
-                        mode="edge",
-                        cval=0,
-                        clip=True,
-                        anti_aliasing=False,
-                    )
+                    res = resize(img_c, resample_shape, order=3, mode="edge",
+                                 cval=0, clip=True, anti_aliasing=False)
                     resized_channels.append(res)
                 image = np.stack(resized_channels, axis=0)
+                if has_mask:
+                    resized_mask_channels = []
+                    for mask_c in label:
+                        mask_res = resize(mask_c, resample_shape, order=0, mode="edge",
+                                          cval=0, clip=True, anti_aliasing=False)
+                        resized_mask_channels.append(mask_res.astype(np.uint8))
+                    label = np.stack(resized_mask_channels, axis=0)
 
         d["resample_flag"] = resample_flag
         d["anisotrophy_flag"] = anisotrophy_flag
@@ -170,5 +186,7 @@ class PreprocessAnisotropy(MapTransform):
             image = self.normalize_intensity(image.copy())
 
         d["image"] = image
+        if has_mask:
+            d["mask"] = label
 
         return d
