@@ -15,11 +15,41 @@ def compute_ewc_loss(model, fisher, params_snapshot, lambda_reg):
     return lambda_reg * ewc_loss
 
 
+def _compute_ewc_data(model, dataloader, device, criterion):
+    """Compute Fisher matrix and parameter snapshot for EWC regularization."""
+    model.eval()
+    fisher = {name: torch.zeros_like(param)
+              for name, param in model.named_parameters() if param.requires_grad}
+    params_snapshot = {name: param.clone()
+                       for name, param in model.state_dict().items()}
+
+    n_batches = 0
+    for batch in dataloader:
+        inputs = batch['image'].to(device)
+        targets = batch['mask'].long().to(device)
+        model.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                fisher[name] += param.grad.detach() ** 2
+        n_batches += 1
+
+    for name in fisher:
+        fisher[name] /= max(n_batches, 1)
+
+    return {
+        'fisher': {k: v.cpu().numpy() for k, v in fisher.items()},
+        'params_snapshot': {k: v.cpu().numpy() for k, v in params_snapshot.items()}
+    }
+
+
 def run_incremental_learning(model_obj, trainingData:dict, trainingOutputs:dict, bs, minTrainImages):
     image_list = trainingData.get('image_list', [])
     if len(image_list) < minTrainImages:
         return
-    
+
     #read model metadata
     net_metadata = model_obj.metadata['net_metadata']
     spatial_dims = net_metadata['spatial_dims']
@@ -31,11 +61,11 @@ def run_incremental_learning(model_obj, trainingData:dict, trainingOutputs:dict,
     model = model_obj.model
     resolution = trainingData.get('resolution', np.ones(spatial_dims))
 
-    if spatial_dims == 3: #take mask list
+    if isinstance(trainingOutputs, dict):
         mask_list = [trainingOutputs[k] for k in sorted(trainingOutputs.keys())]
-    else: 
+    else:
         mask_list = list(trainingOutputs)
-    
+
     assert len(image_list) == len(mask_list)
     samples = []
     for img, mask_dict in zip(image_list, mask_list):
@@ -44,13 +74,13 @@ def run_incremental_learning(model_obj, trainingData:dict, trainingOutputs:dict,
               'mask': mask_dict,
               'resolution': resolution
          })
-    
-    if not use_dynamic: 
-         transforms = build_transform_list(keys=['image', 'mask'], 
+
+    if not use_dynamic:
+         transforms = build_transform_list(keys=['image', 'mask'],
                                            median_spacing=spacing,
                                            spatial_dims=spatial_dims)
-    else: 
-         transforms = build_transforms_dynunet(keys=['image', 'mask'], 
+    else:
+         transforms = build_transforms_dynunet(keys=['image', 'mask'],
                                                patch_size=patch_size,
                                                target_spacing=spacing)
     dataset = Dataset(data=samples, transform=transforms)
@@ -59,23 +89,23 @@ def run_incremental_learning(model_obj, trainingData:dict, trainingOutputs:dict,
     scaler = torch.amp.GradScaler(enabled=True)
     optimizer = torch.optim.AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
-                lr=1e-3, 
+                lr=1e-3,
                 weight_decay=1e-4
             )
-    
+
     criterion = DiceCELoss(to_onehot_y=True, softmax=True)
     n_epochs = 5
-    
+
     fisher_t, snapshot_t = None, None
     lambda_reg = 0.5
-    if ewc_data is not None:                                                                                                                                                   
-        fisher_t   = {k: torch.tensor(v, dtype=torch.float32, device=device)                                                                                                   
+    if ewc_data is not None:
+        fisher_t   = {k: torch.tensor(v, dtype=torch.float32, device=device)
                         for k, v in ewc_data['fisher'].items()}
-        snapshot_t = {k: torch.tensor(v, dtype=torch.float32, device=device)                                                                                                   
+        snapshot_t = {k: torch.tensor(v, dtype=torch.float32, device=device)
                         for k, v in ewc_data['params_snapshot'].items()}
-    
+
     for epoch in range(n_epochs):
-         epoch_loss = 0.0 
+         epoch_loss = 0.0
          n_steps = 0
          for batch in dataloader:
               train_results = train_increment_one_epoch(
@@ -85,6 +115,9 @@ def run_incremental_learning(model_obj, trainingData:dict, trainingOutputs:dict,
               epoch_loss += train_results['loss']
               n_steps += 1
          print(f"[IL] Epoch {epoch + 1}/{n_epochs}  loss: {epoch_loss / max(n_steps, 1):.4f}")
+
+    # Update EWC data for the next incremental learning round
+    model_obj.metadata['ewc_data'] = _compute_ewc_data(model, dataloader, device, criterion)
 
 def train_increment_one_epoch(model, 
                     batch, 
