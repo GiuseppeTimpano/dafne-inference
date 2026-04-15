@@ -1,5 +1,0 @@
-torch>=2.0
-numpy>=1.24
-monai>=1.3
-scikit-image>=0.19
-dafne-dl
